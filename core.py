@@ -16,6 +16,8 @@ class Clip:
     source_in: float
     source_out: float
     issue: str = ''
+    effects: list = dataclasses.field(default_factory=list)
+    time_scale: float = 1
     @property
     def duration(self): return self.end-self.start
 
@@ -54,9 +56,12 @@ def read_session(path, unit='samples'):
             if p.is_file(): resolved = str(p.resolve()); break
         files[f.get('id')] = {'attributes':dict(f.attrib), 'original':next((x for x in candidates if x),''), 'path':resolved}
     tracks, warnings = [], ['源截取模式不会应用 Audition 效果、淡入淡出、增益/声像包络、静音或声道映射；源文件声道为默认依据。']
+    from effects import inspect_scope
+    global_effects=inspect_scope(session,'会话/总线（候选，不推断路由）',skip=('audioTrack','files'))
     for i, track in enumerate(session.iter('audioTrack')):
         name = track.findtext('trackParameters/name') or track.get('name') or f'音轨 {i+1}'
         clips=[]
+        track_effects=inspect_scope(track,f'音轨 {i+1}: {name}',skip=('audioClip',))
         for n, el in enumerate(track.iter('audioClip')):
             try:
                 def t(key):
@@ -71,6 +76,8 @@ def read_session(path, unit='samples'):
                 for key in ('stretchRatio','playbackRate','speed'):
                     if key in el.attrib and abs(float(el.get(key))-1)>1e-7: issue='不支持时间伸缩'
                 clip=Clip(el.get('name') or f'未命名_{n+1}',el.attrib['fileID'],start,end,si,so,issue)
+                clip.effects=inspect_scope(el,'片段')+track_effects+global_effects
+                clip.time_scale=scale
                 clips.append(clip)
             except (ValueError,KeyError) as e:
                 raise ExportError(f'{name} 第 {n+1} 个片段字段无效：{e}')
@@ -132,7 +139,9 @@ class Options:
     ceiling: float=-1
     duplicates: str='自动编号'
     timeline_source: str=''
+    fade_policy: str='关闭'
     def validate(self):
+        if self.fade_policy not in ('关闭','片段相对','源相对','时间轴'): raise ExportError('未知淡变坐标基准')
         if self.rate not in ('会话','源文件') and not 8000<=int(self.rate)<=384000: raise ExportError('采样率须为 8000–384000。')
         if self.channels not in ('源文件','单声道混合','左声道','右声道','立体声'): raise ExportError('未知声道配置')
         if self.sample_type not in ('源文件',*CODECS): raise ExportError('未知采样类型')
@@ -181,6 +190,8 @@ def sample_peak(path,cancel=None):
 
 def export_clip(session,clip,mapping,folder,opt,used,cancel=None):
     opt.validate()
+    from effects import processing_plan
+    effect_filters,effect_warnings=processing_plan(clip,opt)
     if clip.issue and not opt.timeline_source: raise ExportError(clip.issue)
     src=opt.timeline_source or mapping.get(clip.file_id) or session.files.get(clip.file_id,{}).get('path')
     if not src or not Path(src).is_file(): raise ExportError(f'音源缺失：fileID={clip.file_id}')
@@ -201,12 +212,13 @@ def export_clip(session,clip,mapping,folder,opt,used,cancel=None):
         filters.append(f'pan=mono|c0=c{index}')
     elif ch=='单声道混合': filters.append('aformat=channel_layouts=mono')
     elif ch=='立体声': filters.append('aformat=channel_layouts=stereo')
+    filters.extend(effect_filters)
     filters.append(f'aresample={rate}')
     with tempfile.TemporaryDirectory(prefix='.sesx-',dir=folder) as tmp:
         raw=Path(tmp)/'raw.wav'; processed=raw; result=Path(tmp)/'result.wav'
         ff(src,raw,','.join(filters),cancel=cancel)
         report={'name':clip.name,'source':str(src),'source_begin':begin,'duration':length,'source_properties':info,
-                'output':str(target),'options':dataclasses.asdict(opt),'warnings':[]}
+                'output':str(target),'options':dataclasses.asdict(opt),'warnings':effect_warnings,'sesx_processing':clip.effects,'applied_effect_filters':effect_filters}
         if opt.mode=='峰值':
             peak=sample_peak(raw,cancel)
             if math.isfinite(peak):

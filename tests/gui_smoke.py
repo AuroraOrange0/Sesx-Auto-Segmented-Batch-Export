@@ -6,7 +6,7 @@ from test_export import Tests
 from app import App
 import tkinter as tk
 fixture=Tests(); fixture.setUp()
-root=tk.Tk(); app=App(root)
+root=tk.Tk(); app=App(root,fixture.root/"gui-settings.json")
 try:
     app.reload(str(fixture.sesx)); root.update()
     assert len(app.table.get_children())==2
