@@ -15,29 +15,23 @@ class Features(unittest.TestCase):
     def add_xml(self,extra):
         data=self.sesx.read_text(); data=data.replace('sourceOutPoint="72000"/>','sourceOutPoint="72000">'+extra+'</audioClip>')
         self.sesx.write_text(data); self.s=read_session(self.sesx); self.c=self.s.tracks[0][1][0]
-    def test_fades_render(self):
-        self.add_xml('<fadeIn startPoint="0" endPoint="9600" type="lin"/><fadeOut startPoint="38400" endPoint="48000" type="lin"/>')
+    def test_fades_query_only(self):
+        self.add_xml('<fadeIn startPoint="0" endPoint="9600" type="lin"/><fadeOut startPoint="38400" endPoint="48000" type="log"/>')
+        self.assertIn('淡入',effect_summary(self.c)); self.assertIn('淡出',effect_summary(self.c))
         r=self.export(fade_policy='片段相对',sample_type='PCM 16')
-        self.assertEqual(len(r['applied_effect_filters']),2)
-        with wave.open(r['output'],'rb') as f: data=f.readframes(48000)
-        samples=struct.unpack('<'+str(len(data)//2)+'h',data)
-        self.assertLess(abs(samples[200]),500)
-        self.assertGreater(max(abs(x) for x in samples[30000:35000]),11000)
-        self.assertLess(abs(samples[-100]),500)
-    def test_unknown_effect_blocked_and_baked(self):
-        self.add_xml('<effect name="降噪" enabled="true"><parameter name="amount" parameterValue="0.5"/></effect>')
-        self.assertEqual(self.c.effects[0]['name'],'降噪')
-        with self.assertRaises(ExportError): self.export(fade_policy='片段相对')
-        r=self.export(timeline_source=str(self.source),fade_policy='片段相对')
         self.assertEqual(r['applied_effect_filters'],[])
+        self.assertTrue(any('未应用' in w for w in r['warnings']))
+        with wave.open(r['output'],'rb') as a,wave.open(str(self.source),'rb') as b:
+            b.setpos(24000); self.assertEqual(a.readframes(48000),b.readframes(48000))
+    def test_zero_length_fade_not_flagged(self):
+        self.add_xml('<fadeIn startPoint="0" endPoint="0" type="lin"/>')
+        self.assertNotIn('片段：淡入',effect_summary(self.c))
+    def test_unknown_effect_query_and_baked(self):
+        self.add_xml('<effect name="降噪" enabled="true"><parameter name="amount" parameterValue="0.5"/></effect>')
+        self.assertIn('降噪',effect_summary(self.c))
+        r=self.export(timeline_source=str(self.source))
+        self.assertEqual(r['applied_effect_filters'],[]); self.assertEqual(r['source_begin'],2)
         r=self.export(); self.assertTrue(any('降噪' in w for w in r['warnings']))
-    def test_curve_and_coordinate_rejection(self):
-        self.add_xml('<fadeIn startPoint="24000" endPoint="33600" type="log"/>')
-        with self.assertRaises(ExportError): self.export(fade_policy='源相对')
-        self.c.effects[0]['attributes']['type']='lin'
-        self.assertIn('st=0',fade_filters(self.c,'源相对')[0])
-        self.c.effects[0]['attributes']['startPoint']='-1'
-        with self.assertRaises(ExportError): fade_filters(self.c,'片段相对')
     def test_inherited_processing_and_bypass(self):
         self.add_xml('<effectsRack bypass="true"><effect name="Reverb"/></effectsRack>')
         data=self.sesx.read_text().replace('<trackParameters>','<effect name="Track EQ"/><trackParameters>',1)

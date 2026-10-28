@@ -9,10 +9,11 @@ except ImportError:
     raise SystemExit(1)
 from core import *
 from preferences import Preferences
+from loudness_modes import MODES,ALIASES,DEFAULTS,note
 
 class App:
     def __init__(self,root,settings_path=None):
-        self.root=root; root.title('SESX 片段批量导出 v0.2'); root.geometry('1280x960'); root.minsize(1100,900)
+        self.root=root; root.title('SESX 片段批量导出 v0.3'); root.geometry('1280x1000'); root.minsize(1100,850)
         self.session=None; self.mapping={}; self.q=queue.Queue(); self.cancel=threading.Event(); self.busy=False
         self.vars={}; self.mutators=[]
         self.preferences=Preferences(settings_path); self.save_job=None; self.restoring=True
@@ -38,51 +39,69 @@ class App:
         effectsrow=ttk.Frame(root,padding=(10,0)); effectsrow.pack(fill='x')
         self.button(effectsrow,'查询所选片段效果 / 处理链',self.show_effects).pack(side='left')
         self.button(effectsrow,'预览当前导出效果',self.preview_output).pack(side='left',padx=10)
-        ttk.Label(effectsrow,text='预览与导出共用同一处理流程；降噪/混响等需先烘焙。').pack(side='left')
+        self.button(effectsrow,'选中有处理声明的片段',self.select_effects).pack(side='left',padx=5)
+        ttk.Label(effectsrow,text='效果仅查询；声音由 Audition 烘焙保留。').pack(side='left')
         tableframe=ttk.Frame(root); tableframe.pack(fill='both',expand=True,padx=10)
-        columns=('name','start','source','duration','file','status')
-        self.table=ttk.Treeview(tableframe,columns=columns,show='headings',selectmode='extended')
-        for c,title,width in zip(columns,('片段名称','时间轴起点 (秒)','源偏移 (秒)','时长 (秒)','fileID / 文件','状态'),(270,120,120,100,260,210)):
+        columns=('name','start','source','duration','file','effects','status')
+        self.table=ttk.Treeview(tableframe,columns=columns,show='headings',selectmode='extended',height=6)
+        for c,title,width in zip(columns,('片段名称','时间轴起点 (秒)','源偏移 (秒)','时长 (秒)','fileID / 文件','效果 / 处理声明','状态'),(210,100,100,85,170,290,180)):
             self.table.heading(c,text=title); self.table.column(c,width=width)
         scroll=ttk.Scrollbar(tableframe,orient='vertical',command=self.table.yview)
-        self.table.configure(yscrollcommand=scroll.set); scroll.pack(side='right',fill='y'); self.table.pack(fill='both',expand=True)
+        hscroll=ttk.Scrollbar(tableframe,orient='horizontal',command=self.table.xview); hscroll.pack(side='bottom',fill='x')
+        self.table.configure(xscrollcommand=hscroll.set,yscrollcommand=scroll.set); scroll.pack(side='right',fill='y'); self.table.pack(fill='both',expand=True)
         config=ttk.LabelFrame(root,text='导出设置（WAV；默认会话采样率 + 每个源文件的声道/编码）',padding=8); config.pack(fill='x',padx=10,pady=5)
-        fields=[('rate','采样率',['会话','源文件','44100','48000','96000'],'会话'),('channels','声道',['源文件','单声道混合','左声道','右声道','立体声'],'源文件'),('sample_type','采样类型',['源文件',*CODECS],'源文件'),('mode','响度模式',['关闭','峰值','EBU R128 LUFS','True Peak Ceiling'],'关闭'),('duplicates','重名处理',['自动编号','跳过','报错'],'自动编号')]
+        fields=[('rate','采样率',['会话','源文件','44100','48000','96000'],'会话'),('channels','声道',['源文件','单声道混合','左声道','右声道','立体声'],'源文件'),('sample_type','采样类型',['源文件',*CODECS],'源文件'),('mode','响度模式',MODES,'关闭'),('duplicates','重名处理',['自动编号','跳过','报错'],'自动编号')]
         for col,(key,label,values,default) in enumerate(fields):
             ttk.Label(config,text=label).grid(row=0,column=col,sticky='w',padx=5)
             self.combo(config,key,values,default,22,editable=key=='rate').grid(row=1,column=col,padx=5,sticky='ew')
-        for col,(key,label,value) in enumerate([('peak','峰值 dBFS','-1'),('lufs','目标 LUFS','-23'),('ceiling','真实峰值上限 dBTP','-1')]):
+        for col,(key,label,value) in enumerate([('peak','峰值目标 dBFS/dBTP','-1'),('lufs','目标 LUFS','-23'),('ceiling','真实峰值上限 dBTP','-1')]):
             frame=ttk.Frame(config); frame.grid(row=2,column=col,pady=5,sticky='w')
             ttk.Label(frame,text=label).pack(side='left'); self.vars[key]=tk.StringVar(value=value)
             entry=ttk.Entry(frame,textvariable=self.vars[key],width=7); entry.pack(side='left'); self.mutators.append(entry)
-        ttk.Label(config,text='Ceiling：整段衰减，不提升音量。LUFS：两遍匹配 + 最终文件峰值校验。').grid(row=3,column=0,columnspan=5,sticky='w')
-        fades=ttk.Frame(root,padding=(10,5)); fades.pack(fill='x')
-        ttk.Label(fades,text='SESX 线性淡入淡出（实验，坐标基准需核对）').pack(side='left')
-        self.combo(fades,'fade_policy',['关闭','片段相对','源相对','时间轴'],'关闭',16).pack(side='left',padx=10)
-        ttk.Label(fades,text='发现无法渲染的处理时拒绝仅应用淡变；烘焙模式不重复处理。').pack(side='left')
+        for col,(key,label,value) in enumerate([('rms_target','RMS 目标 dBFS','-20'),('tolerance','目标容差 LU/dB','0.5'),('lookahead','限制器预读 ms','12'),('release','限制器释放 ms','200')]):
+            frame=ttk.Frame(config); frame.grid(row=3,column=col,pady=4,sticky='w')
+            ttk.Label(frame,text=label).pack(side='left'); self.vars[key]=tk.StringVar(value=value)
+            entry=ttk.Entry(frame,textvariable=self.vars[key],width=6); entry.pack(side='left'); self.mutators.append(entry)
+        self.combo(config,'peak_protection',['自动','关闭','整段衰减','过采样限制器'],'自动',18).grid(row=3,column=4)
+        refrow=ttk.Frame(config); refrow.grid(row=4,column=0,columnspan=5,sticky='ew')
+        self.button(refrow,'选择 RMS 参考文件',self.pick_reference).pack(side='left')
+        self.vars['reference_file']=tk.StringVar()
+        entry=ttk.Entry(refrow,textvariable=self.vars['reference_file']); entry.pack(side='left',fill='x',expand=True,padx=5); self.mutators.append(entry)
+        self.button(refrow,'清除参考',lambda:self.vars['reference_file'].set('')).pack(side='left')
+        noteframe=ttk.Frame(config); noteframe.grid(row=5,column=0,columnspan=5,sticky='ew',pady=5)
+        self.mode_note=tk.Text(noteframe,height=4,wrap='word',width=110)
+        notes_scroll=ttk.Scrollbar(noteframe,orient='vertical',command=self.mode_note.yview)
+        self.mode_note.configure(yscrollcommand=notes_scroll.set); notes_scroll.pack(side='right',fill='y'); self.mode_note.pack(side='left',fill='x',expand=True)
+        self.vars['mode'].trace_add('write',self.update_mode_note)
+        mode_widget=next(w for w in self.mutators if isinstance(w,ttk.Combobox) and str(w.cget('textvariable'))==str(self.vars['mode']))
+        mode_widget.bind('<<ComboboxSelected>>',self.apply_preset)
+        self.update_mode_note()
         out=ttk.Frame(root,padding=10); out.pack(fill='x')
         self.vars['output']=tk.StringVar(); ttk.Label(out,text='输出目录').pack(side='left')
         entry=ttk.Entry(out,textvariable=self.vars['output']); entry.pack(side='left',fill='x',expand=True,padx=5); self.mutators.append(entry)
         self.button(out,'选择目录',self.pick_output).pack(side='left')
         mix=ttk.Frame(root,padding=(10,0)); mix.pack(fill='x')
         self.vars['timeline_source']=tk.StringVar()
-        self.button(mix,'选择已烘焙整轨混缩（可选）',self.pick_mix).pack(side='left')
-        self.button(mix,'清除混缩',lambda:self.vars['timeline_source'].set('')).pack(side='left',padx=5)
+        self.combo(mix,'source_mode',['原始音源（效果仅查询）','Audition 整轨缩混'],'原始音源（效果仅查询）',26).pack(side='left',padx=5)
+        self.button(mix,'选择 Audition 整轨缩混',self.pick_mix).pack(side='left')
+        self.button(mix,'清除混缩',self.clear_mix).pack(side='left',padx=5)
         ttk.Label(mix,textvariable=self.vars['timeline_source']).pack(side='left')
         ttk.Label(root,text='整轨混缩模式按时间轴起止截取：混缩必须从会话 0 秒开始，使用所需音轨并已烘焙效果。').pack(anchor='w',padx=10)
         actions=ttk.Frame(root,padding=10); actions.pack(fill='x')
         self.button(actions,'导出全部片段',lambda:self.start(False)).pack(side='left')
         self.button(actions,'导出所选片段',lambda:self.start(True)).pack(side='left',padx=10)
         ttk.Button(actions,text='取消',command=self.cancel.set).pack(side='left')
-        self.button(actions,'保存预览 CSV',self.save_csv).pack(side='left',padx=10)
+        self.button(actions,'保存清单 CSV（选择优先）',self.save_csv).pack(side='left',padx=10)
         self.progress=ttk.Label(actions,text='就绪'); self.progress.pack(side='left')
         self.log=tk.Text(root,height=7,wrap='word'); self.log.pack(fill='x',padx=10,pady=(0,10))
         root.protocol('WM_DELETE_WINDOW',self.close); root.after(100,self.poll)
         self.play_tmp=None
         self.last_preview_report=None
         self.restore_globals()
+        self.update_mode_note()
         self.restoring=False
         for var in self.vars.values(): var.trace_add('write',self.schedule_save)
+        self.vars['source_mode'].trace_add('write',lambda *args:self.refresh() if self.session and not self.restoring else None)
         if self.preferences.error: self.logline(self.preferences.error)
         last=self.preferences.data.get('last_session','')
         if isinstance(last,str) and last:
@@ -94,6 +113,7 @@ class App:
         for key,var in self.vars.items():
             if key in ('track','timeline_source'): continue
             value=values.get(key)
+            if key=='mode': value=ALIASES.get(value,value)
             if isinstance(value,str):
                 widget=next((w for w in self.mutators if isinstance(w,ttk.Combobox) and str(w.cget('textvariable'))==str(var)),None)
                 if widget and getattr(widget,'_idle_state','')=='readonly' and value not in widget.cget('values'): continue
@@ -107,7 +127,7 @@ class App:
             self.root.after_cancel(self.save_job); self.save_job=None
         values={k:v.get() for k,v in self.vars.items() if k not in ('track','timeline_source')}
         if self.session:
-            self.projects[str(self.session.path)]={'mapping':dict(self.mapping),'track':self.vars['track'].get(),'timeline_source':self.vars['timeline_source'].get()}
+            self.projects[str(self.session.path)]={'mapping':dict(self.mapping),'track':self.vars['track'].get(),'timeline_source':self.vars['timeline_source'].get(),'source_mode':self.vars['source_mode'].get()}
         data={'values':values,'directories':self.directories,'projects':self.projects,
               'last_session':str(self.session.path) if self.session else self.preferences.data.get('last_session','')}
         if not self.preferences.write(data): self.logline(self.preferences.error)
@@ -198,6 +218,8 @@ class App:
                 for fid,path in saved_mapping.items():
                     if fid in self.mapping and isinstance(path,str): self.mapping[fid]=path
             self.vars['timeline_source'].set(saved.get('timeline_source','') if isinstance(saved.get('timeline_source',''),str) else '')
+            if self.vars['timeline_source'].get(): self.vars['source_mode'].set(saved.get('source_mode','Audition 整轨缩混'))
+            else: self.vars['source_mode'].set('原始音源（效果仅查询）')
             self.pathlabel.configure(text=str(session.path))
             self.track.configure(values=[f'{i+1}: {name}' for i,(name,clips) in enumerate(session.tracks)])
             self.track.current(0)
@@ -212,13 +234,15 @@ class App:
         if self.vars['timeline_source'].get():
             self.vars['timeline_source'].set('')
             self.logline('切换音轨已清除烘焙混缩，请为当前音轨重新选择正确混缩。')
+        self.vars['source_mode'].set('原始音源（效果仅查询）')
         self.refresh(); self.save_settings()
     def clips(self): return self.session.tracks[self.track.current()][1] if self.session else []
     def refresh(self):
         self.table.delete(*self.table.get_children())
+        from effects import effect_summary
         for i,c in enumerate(self.clips()):
             path=self.mapping.get(c.file_id,'')
-            self.table.insert('', 'end',iid=str(i),values=(c.name,f'{c.start:.6f}',f'{c.source_in:.6f}',f'{c.duration:.6f}',f'{c.file_id}: {Path(path).name if path else "未映射"}',c.issue or ('待导出 / 已烘焙' if self.vars['timeline_source'].get() else '待导出（效果见查询）' if path else '缺少音源')))
+            self.table.insert('', 'end',iid=str(i),values=(c.name,f'{c.start:.6f}',f'{c.source_in:.6f}',f'{c.duration:.6f}',f'{c.file_id}: {Path(path).name if path else "未映射"}',effect_summary(c),c.issue or ('待导出 / 已烘焙' if self.vars['source_mode'].get()=='Audition 整轨缩混' and self.vars['timeline_source'].get() else '待导出（效果见查询）' if path else '缺少音源')))
     def map_source(self):
         chosen=self.table.selection()
         if not chosen: messagebox.showinfo('映射','请选中一个片段；同 fileID 的全部片段会一起映射。'); return
@@ -246,9 +270,27 @@ class App:
         if p: self.vars['output'].set(p); self.remember_path('output',p,True)
     def pick_mix(self):
         p=filedialog.askopenfilename(initialdir=self.dialog_dir('mix'),title='选择从会话 0 秒开始的已烘焙整轨混缩')
-        if p: self.vars['timeline_source'].set(p); self.remember_path('mix',p); self.refresh()
+        if p: self.vars['timeline_source'].set(p); self.vars['source_mode'].set('Audition 整轨缩混'); self.remember_path('mix',p); self.refresh()
+    def clear_mix(self):
+        self.vars['timeline_source'].set(''); self.vars['source_mode'].set('原始音源（效果仅查询）'); self.refresh()
+    def update_mode_note(self,*args):
+        self.mode_note.configure(state='normal'); self.mode_note.delete('1.0','end')
+        self.mode_note.insert('end',note(self.vars['mode'].get())); self.mode_note.configure(state='disabled')
+    def apply_preset(self,event=None):
+        mode=self.vars['mode'].get()
+        if mode in DEFAULTS:
+            lufs,ceiling=DEFAULTS[mode]; self.vars['lufs'].set(str(lufs)); self.vars['ceiling'].set(str(ceiling))
+        self.update_mode_note()
+    def pick_reference(self):
+        p=filedialog.askopenfilename(initialdir=self.dialog_dir('reference'),title='选择 RMS 参考音频（测量整个文件）')
+        if p: self.vars['reference_file'].set(p); self.remember_path('reference',p)
     def options(self):
-        return Options(**{f.name:(float(self.vars[f.name].get()) if f.name in ('peak','lufs','ceiling') else self.vars[f.name].get()) for f in dataclasses.fields(Options)})
+        numeric={'peak','lufs','ceiling','rms_target','tolerance','lookahead','release'}
+        data={f.name:(float(self.vars[f.name].get()) if f.name in numeric else self.vars[f.name].get()) for f in dataclasses.fields(Options) if f.name in self.vars}
+        data['fade_policy']='关闭'
+        if self.vars['source_mode'].get()=='原始音源（效果仅查询）': data['timeline_source']=''
+        elif not data.get('timeline_source'): raise ExportError('请选择当前音轨的 Audition 整轨缩混文件')
+        return Options(**data)
     def start(self,selected):
         if not self.session or self.busy: return
         try:
@@ -273,7 +315,7 @@ class App:
                         if self.cancel.is_set(): break
                         try:
                             result=export_clip(session,c,mapping,folder,opt,used,self.cancel)
-                            status='完成' if result['status']=='ok' else '跳过重名'
+                            status=('已导出（未达响度目标）' if result.get('matching',{}).get('target_met') is False else '完成') if result['status']=='ok' else '跳过重名'
                             if result['status']=='ok': ok+=1
                             else: skipped+=1
                         except Cancelled: break
@@ -307,13 +349,20 @@ class App:
             except Exception as e: self.q.put(('log','试听：'+str(e)))
             finally: self.q.put(('done','原始片段试听结束（未应用导出设置）'))
         threading.Thread(target=worker,daemon=True).start()
+    def select_effects(self):
+        from effects import neutral
+        selected=[str(i) for i,c in enumerate(self.clips()) if any(not neutral(r) for r in c.effects)]
+        self.table.selection_set(selected)
+        self.logline(f'已选中 {len(selected)} 段有处理声明的片段；可保存 CSV 清单后在 Audition 手动导出。')
     def save_csv(self):
         p=filedialog.asksaveasfilename(initialdir=self.dialog_dir('csv'),defaultextension='.csv')
         if p:
             self.remember_path('csv',p)
             with open(p,'w',encoding='utf-8-sig',newline='') as f:
-                w=csv.writer(f); w.writerow(['片段名','时间轴起点秒','时间轴终点秒','源起点秒','源终点秒','fileID','源文件','问题'])
-                for c in self.clips(): w.writerow([c.name,c.start,c.end,c.source_in,c.source_out,c.file_id,self.mapping.get(c.file_id,''),c.issue])
+                w=csv.writer(f); w.writerow(['片段名','时间轴起点秒','时间轴终点秒','源起点秒','源终点秒','fileID','源文件','效果声明','问题'])
+                selected=self.table.selection()
+                clips=[self.clips()[int(i)] for i in selected] if selected else self.clips()
+                for c in clips: w.writerow([c.name,c.start,c.end,c.source_in,c.source_out,c.file_id,self.mapping.get(c.file_id,''),__import__('effects').effect_summary(c),c.issue])
     def poll(self):
         try:
             while True:

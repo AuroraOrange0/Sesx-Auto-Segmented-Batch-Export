@@ -11,7 +11,7 @@ fixture=Tests(); fixture.setUp(); prefs=fixture.root/'settings.json'
 root=tk.Tk(); app=App(root,prefs)
 try:
     app.reload(fixture.sesx); root.update()
-    app.vars['output'].set(str(fixture.out)); app.vars['mode'].set('峰值'); app.vars['peak'].set('-4')
+    app.vars['output'].set(str(fixture.out)); app.vars['mode'].set('峰值幅度'); app.vars['peak'].set('-4')
     app.vars['channels'].set('左声道'); app.mapping['0']=str(fixture.source)
     app.directories['output']=str(fixture.out)
     # Debounced save must happen without closing or exporting.
@@ -21,10 +21,22 @@ try:
     app.close()
     root=tk.Tk(); app=App(root,prefs); root.update()
     assert app.session.path==fixture.sesx.resolve()
-    assert app.vars['mode'].get()=='峰值' and app.vars['peak'].get()=='-4'
+    assert app.vars['mode'].get()=='峰值幅度' and app.vars['peak'].get()=='-4'
     assert app.mapping['0']==str(fixture.source)
     with patch('app.filedialog.askdirectory',return_value='') as dialog:
         app.pick_output(); assert dialog.call_args.kwargs['initialdir']==str(fixture.out)
+    # Mode notes, presets, effect column/filter and CSV manual-export list.
+    app.vars['mode'].set('ATSC A/85 响度'); app.apply_preset()
+    assert app.vars['lufs'].get()=='-24' and '对白锚点' in app.mode_note.get('1.0','end')
+    app.vars['mode'].set('总计 RMS'); app.update_mode_note()
+    assert '没有 K 加权' in app.mode_note.get('1.0','end')
+    app.vars['mode'].set('峰值幅度')
+    app.clips()[0].effects=[{'tag':'fadeIn','scope':'片段','name':'fadeIn','attributes':{'startPoint':'0','endPoint':'9600'},'disabled':False,'parameters':[],'has_keyframes':False,'xml':'<fadeIn/>'}]
+    app.refresh(); assert '淡入' in app.table.set('0','effects')
+    app.select_effects(); assert app.table.selection()==('0',)
+    csvfile=fixture.root/'manual.csv'
+    with patch('app.filedialog.asksaveasfilename',return_value=str(csvfile)): app.save_csv()
+    assert '淡入' in csvfile.read_text(encoding='utf-8-sig') and len(csvfile.read_text().splitlines())==2
     app.table.selection_set('0'); app.show_effects(); root.update()
     # Preview uses export_clip with the current options, not a separate approximation.
     with patch('app.run',return_value=('','')):

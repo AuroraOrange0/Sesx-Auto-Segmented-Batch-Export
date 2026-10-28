@@ -21,6 +21,10 @@ def inspect_scope(node, scope, skip=()):
 
 def neutral(record):
     if record['disabled']: return True
+    if record['tag'] in ('fadeIn','fadeOut'):
+        try:
+            if float(record['attributes']['startPoint'])==float(record['attributes']['endPoint']): return True
+        except (KeyError,ValueError,TypeError): pass
     if record['has_keyframes']: return False
     cid=record['attributes'].get('componentID','')
     known={'Audition.Fader':('volume',1),'Audition.StereoPanner':('Pan',0),'Audition.Mute':('mute',0)}
@@ -30,37 +34,26 @@ def neutral(record):
     try: return bool(vals) and all(float(v)==value for v in vals)
     except (ValueError,TypeError): return False
 
-def fade_filters(clip,policy):
-    from core import ExportError
-    if policy=='关闭': return []
-    origin={'片段相对':0,'源相对':clip.source_in,'时间轴':clip.start}[policy]
-    result=[]
-    for rec in clip.effects:
-        if rec['tag'] not in ('fadeIn','fadeOut') or rec['disabled']: continue
-        attrs=rec['attributes']
-        # Only implement a verified linear curve, never guess proprietary curves.
-        if attrs.get('type','').lower() not in ('lin','linear'):
-            raise ExportError('SESX 淡变曲线不是已支持的 linear；请先烘焙。')
-        if rec['has_keyframes'] or any(tag in rec['xml'] for tag in ('controlPoint','curvePoint')):
-            raise ExportError('不支持自定义淡变曲线；请先烘焙。')
-        try: start=float(attrs['startPoint'])/clip.time_scale-origin; end=float(attrs['endPoint'])/clip.time_scale-origin
-        except (ValueError,KeyError): raise ExportError('淡变边界无法解析')
-        if not all(math.isfinite(x) for x in (start,end)) or start< -1e-8 or end>clip.duration+1e-8 or end<=start:
-            raise ExportError('淡变边界与选择的坐标基准不符；请选择正确基准或烘焙。')
-        result.append(f'afade=t={"in" if rec["tag"]=="fadeIn" else "out"}:st={max(0,start)}:d={end-start}:curve=tri')
-    return result
+def effect_summary(clip):
+    records=clip.effects
+    relevant=[r for r in records if not neutral(r)]
+    direct=[r for r in relevant if r['scope']=='片段']
+    inherited=[r for r in relevant if r['scope'].startswith('音轨')]
+    buses=[r for r in relevant if r not in direct and r not in inherited]
+    parts=[]
+    for prefix,items in [('片段',direct),('音轨',inherited),('会话候选',buses)]:
+        if items:
+            names=[{'fadeIn':'淡入','fadeOut':'淡出'}.get(r['tag'],r['name']) for r in items]
+            parts.append(prefix+'：'+'、'.join(dict.fromkeys(names)))
+    if parts: return '；'.join(parts)
+    if records and all(neutral(r) for r in records): return '仅发现旁路/中性处理（需核对）'
+    return '未发现可识别效果（非无效果保证）'
 
 def processing_plan(clip,opt):
-    from core import ExportError
-    records=clip.effects
     if opt.timeline_source:
-        return [], ['已使用烘焙混缩；SESX 效果不重复应用，烘焙内容由用户在 Audition 确认。']
-    other=[r for r in records if r['tag'] not in ('fadeIn','fadeOut') and not neutral(r)]
-    if opt.fade_policy!='关闭' and other:
-        raise ExportError('发现无法渲染的效果/自动化/路由：'+', '.join(r['name'] for r in other[:6])+'。请使用已烘焙整轨混缩。')
-    filters=fade_filters(clip,opt.fade_policy)
+        return [], ['已使用 Audition 烘焙缩混；按时间轴切段，不重复应用 SESX 效果。']
+    relevant=[r for r in clip.effects if not neutral(r)]
     warnings=[]
-    if other: warnings.append('源截取未应用以下 SESX 效果/处理：'+', '.join(r['name'] for r in other))
-    if opt.fade_policy=='关闭' and any(r['tag'] in ('fadeIn','fadeOut') and not r['disabled'] for r in records): warnings.append('源截取未应用 SESX 淡入淡出。')
-    if filters: warnings.append('已应用 SESX 线性淡变；坐标基准由用户选择，尚未对原工程验证。')
-    return filters,warnings
+    if relevant: warnings.append('原始音源截取未应用 SESX 效果：'+effect_summary(clip)+'。请在 Audition 手动导出，或选择整轨缩混。')
+    if opt.fade_policy!='关闭': warnings.append('旧版淡变配置已忽略；v0.3 只查询效果，不直接渲染淡变。')
+    return [],warnings

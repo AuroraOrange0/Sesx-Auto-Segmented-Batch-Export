@@ -139,13 +139,23 @@ class Options:
     ceiling: float=-1
     duplicates: str='自动编号'
     timeline_source: str=''
-    fade_policy: str='关闭'
+    fade_policy: str='关闭'  # v0.2 compatibility only; never renders SESX fades
+    rms_target: float=-20
+    reference_file: str=''
+    tolerance: float=.5
+    peak_protection: str='自动'
+    lookahead: float=12
+    release: float=200
     def validate(self):
         if self.fade_policy not in ('关闭','片段相对','源相对','时间轴'): raise ExportError('未知淡变坐标基准')
         if self.rate not in ('会话','源文件') and not 8000<=int(self.rate)<=384000: raise ExportError('采样率须为 8000–384000。')
         if self.channels not in ('源文件','单声道混合','左声道','右声道','立体声'): raise ExportError('未知声道配置')
         if self.sample_type not in ('源文件',*CODECS): raise ExportError('未知采样类型')
-        if self.mode not in ('关闭','峰值','EBU R128 LUFS','True Peak Ceiling'): raise ExportError('未知响度模式')
+        from loudness_modes import MODES,ALIASES,LEGACY
+        if ALIASES.get(self.mode,self.mode) not in MODES: raise ExportError('未知响度模式')
+        if self.mode in LEGACY: raise ExportError('Adobe 旧版算法未实现，请在 Audition 匹配后缩混；不能用其他算法冒充。')
+        if self.peak_protection not in ('自动','关闭','整段衰减','过采样限制器'): raise ExportError('未知峰值保护方式')
+        if not all(math.isfinite(v) for v in (self.rms_target,self.tolerance,self.lookahead,self.release)) or not -90<=self.rms_target<=0 or not 0<=self.tolerance<=10 or not .1<=self.lookahead<=80 or not 1<=self.release<=8000: raise ExportError('RMS -90～0；容差 0～10；预读 0.1～80 ms；释放 1～8000 ms。')
         if not all(math.isfinite(v) for v in (self.peak,self.lufs,self.ceiling)): raise ExportError('目标值须为有限数字')
         if not -60<=self.peak<=0 or not -70<=self.lufs<=-5 or not -9<=self.ceiling<=0: raise ExportError('峰值 -60～0 dBFS；LUFS -70～-5；True Peak -9～0 dBTP。')
         if self.duplicates not in ('自动编号','跳过','报错'): raise ExportError('未知重名策略')
@@ -219,34 +229,11 @@ def export_clip(session,clip,mapping,folder,opt,used,cancel=None):
         ff(src,raw,','.join(filters),cancel=cancel)
         report={'name':clip.name,'source':str(src),'source_begin':begin,'duration':length,'source_properties':info,
                 'output':str(target),'options':dataclasses.asdict(opt),'warnings':effect_warnings,'sesx_processing':clip.effects,'applied_effect_filters':effect_filters}
-        if opt.mode=='峰值':
-            peak=sample_peak(raw,cancel)
-            if math.isfinite(peak):
-                processed=Path(tmp)/'peak.wav'; ff(raw,processed,f'volume={opt.peak-peak}dB',cancel=cancel)
-            else: report['warnings'].append('静音：保持静音，不做峰值提升')
-        elif opt.mode=='EBU R128 LUFS':
-            stats=loudness(raw,opt,cancel); report['loudnorm_input']=stats
-            if not all(math.isfinite(float(stats[k])) for k in ('input_i','input_tp','input_lra','input_thresh','target_offset')):
-                raise ExportError('静音/过短音频无法可靠测量 LUFS；请改用关闭或峰值模式。')
-            filt=f'loudnorm=I={opt.lufs}:TP={opt.ceiling}:LRA=11:linear=true:print_format=json'
-            for key,param in [('input_i','measured_I'),('input_tp','measured_TP'),('input_lra','measured_LRA'),('input_thresh','measured_thresh'),('target_offset','offset')]: filt+=f':{param}={stats[key]}'
-            processed=Path(tmp)/'lufs.wav'
-            _,err=ff(raw,processed,filt+f',aresample={rate}',cancel=cancel)
-            blocks=re.findall(r'\{\s*"input_i".*?\}',err,re.S)
-            if blocks: report['loudnorm_render']=json.loads(blocks[-1])
-            report['warnings'].append('峰值/动态范围约束可能导致动态处理或最终 LUFS 偏离目标；以最终测量为准。')
-        ff(processed,result,codec=CODECS[kind],cancel=cancel)
-        if opt.mode in ('True Peak Ceiling','EBU R128 LUFS'):
-            # Measure the final encoded, resampled file. Attenuate the entire clip;
-            # this is a ceiling-only gain operation, not a brickwall limiter.
-            for attempt in range(4):
-                stats=loudness(result,opt,cancel); tp=float(stats['input_tp'])
-                if not math.isfinite(tp) or tp<=opt.ceiling-.04: break
-                reduced=Path(tmp)/f'reduced{attempt}.wav'
-                ff(result,reduced,f'volume={opt.ceiling-tp-.08}dB',CODECS[kind],cancel)
-                os.replace(reduced,result)
-            else: raise ExportError('最终真实峰值未达到上限，未提交文件')
-            report['final_loudness']=stats
+        from loudness_modes import render
+        matching=render(raw,result,tmp,opt,rate,CODECS[kind],cancel)
+        report['matching']=matching
+        report['warnings'].extend(matching['warnings'])
+        if 'final_loudness' in matching: report['final_loudness']=matching['final_loudness']
         output_info=probe(result,cancel)
         if abs(output_info['duration']-length)>max(2/rate,2/info['rate']): raise ExportError('输出时长校验失败')
         if cancel and cancel.is_set(): raise Cancelled('已取消')
